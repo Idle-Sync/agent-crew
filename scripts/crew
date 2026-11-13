@@ -411,7 +411,7 @@ cmd_status() {
         [ "$PAUSED" = yes ] && st=paused
         tf=$(transcript "$s"); age=$(( ($(date +%s) - $(stat -c %Y "$tf" 2>/dev/null || date +%s)) / 60 ))m
         ctx=$(( $(ctx_tokens "$s") * 100 / CTX_WINDOW ))%
-        link=$(tmux capture-pane -p -S -3000 -t "=$s:" | grep -o 'https://claude.ai/code/session_[A-Za-z0-9]*' | tail -1)
+        link=$(tmux capture-pane -p -S -3000 -t "=$s:" | grep -o 'https://claude.ai/code/session_[A-Za-z0-9]*' | tail -1 || true)
       else st=down age=- ctx=- link=-; fi
       printf '%-28s %-8s %-9s %-7s %-8s %s\n' "$s" "$MODE" "$st" "$age" "$ctx" "${link:--}"
     done
