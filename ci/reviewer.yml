@@ -1,0 +1,45 @@
+name: agent-crew reviewer
+
+# Reviews each PR when it opens or gets new commits; once a day (evening, India time by
+# default; change the cron to your evening in UTC) it decides whether to cut a release.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "30 15 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: agent-crew-reviewer-${{ github.event.pull_request.number || 'release' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.CREW_REVIEWER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CREW_REVIEWER_TOKEN }}
+          fetch-depth: 0
+      - name: git identity
+        run: |
+          login=$(gh api user -q .login)
+          git config --global user.name "$login"
+          git config --global user.email "$(gh api user -q '"\(.id)+\(.login)@users.noreply.github.com"')"
+      - uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.CREW_REVIEWER_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--max-turns 120 --allowedTools Bash,Read,Write,Edit,Glob,Grep"
+          prompt: |
+            Read .github/agent-crew/reviewer.md and follow it, with these changes for GitHub Actions:
+            there is no state file and no terminal messages, so skip those parts.
+            ${{ github.event_name == 'pull_request' && format('Review PR #{0} (head {1}) only, merge it if your verdict allows, then stop.', github.event.pull_request.number, github.event.pull_request.head.sha) || 'This is the daily release run: decide by the Releases section whether what merged since the last release should be released now, do it if so, then stop. Also review any open PR whose latest commit has no review from you yet.' }}

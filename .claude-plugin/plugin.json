@@ -1,0 +1,15 @@
+{
+  "name": "agent-crew",
+  "version": "0.1.0",
+  "description": "A two-agent crew that maintains a GitHub repo: an issue fixer that opens one root-cause PR per issue, and a PR reviewer that reviews, merges, files follow-ups and cuts releases. Runs on your machine (optionally always-on) or in GitHub Actions.",
+  "author": {
+    "name": "Sayantan Ghosh",
+    "url": "https://idlesync.in"
+  },
+  "homepage": "https://github.com/Idle-Sync/agent-crew",
+  "repository": "https://github.com/Idle-Sync/agent-crew",
+  "license": "MIT",
+  "keywords": ["agents", "github", "issues", "pull-requests", "code-review", "automation", "maintainer"],
+  "commands": "./commands",
+  "hooks": "./hooks/hooks.json"
+}

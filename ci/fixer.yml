@@ -1,0 +1,49 @@
+name: agent-crew fixer
+
+# One run handles one task: the highest-priority open issue without a PR, or a PR of the
+# fixer's with changes requested. Runs never overlap.
+on:
+  issues:
+    types: [opened, reopened, labeled]
+  pull_request_review:
+    types: [submitted]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: agent-crew-fixer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    if: github.event_name != 'pull_request_review' || github.event.review.state == 'changes_requested'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.CREW_FIXER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CREW_FIXER_TOKEN }}
+          fetch-depth: 0
+      - name: git identity
+        run: |
+          login=$(gh api user -q .login)
+          git config --global user.name "$login"
+          git config --global user.email "$(gh api user -q '"\(.id)+\(.login)@users.noreply.github.com"')"
+      - uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.CREW_FIXER_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--max-turns 150 --allowedTools Bash,Read,Write,Edit,Glob,Grep"
+          prompt: |
+            Read .github/agent-crew/fixer.md and follow it, with these changes for GitHub Actions:
+            there is no state file, no status file and no terminal messages, so skip those parts;
+            your queue is GitHub. Do exactly one task (the first one the Order section picks),
+            push it as a PR or as a fix on your PR branch, then stop. If there is no task, stop.
+            This run was triggered by: ${{ github.event_name }}.

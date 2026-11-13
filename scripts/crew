@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# crew: run an agent-crew (an issue fixer and a PR reviewer) on a GitHub repo.
+#
+#   crew install                     set up ~/.local/bin/crew, the systemd units and timers, crew.conf
+#   crew assign <owner/repo> [options]
+#       --mode local|ci              local: two Claude Code sessions on this machine (default)
+#                                    ci: GitHub Actions workflows in the repo, opened as a PR
+#       --sticky | --no-sticky       local only: start at boot and resume after restarts (default: sticky)
+#       --fixer-account <gh user>    GitHub login the fixer works as (default: the active gh login)
+#       --reviewer-account <gh user> GitHub login the reviewer works as (default: same as the fixer)
+#       --fixer-model <m> --reviewer-model <m>   Claude model per agent (default: your Claude Code default)
+#       --rules <file>               extra repo-specific rules appended to both briefs
+#       --slug <name>                short name for the crew (default: the repo name)
+#       --no-github-setup            do not touch repo settings, collaborators or labels
+#   crew status                      every crew: sessions, busy/idle, last activity, context, link
+#   crew notify <session> <text>     type a message into a session (the fixer only takes it when idle)
+#   crew pause <slug> | crew resume <slug>
+#   crew unassign <slug>             stop a local crew; clones and state are kept
+#   crew rollover [session]          continue a session in a fresh conversation (brief + state.md)
+#   crew poll | crew watch | crew digest     run by the systemd timers
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+ROOT=$(dirname "$(dirname "$SELF")")
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agent-crew"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/agent-crew"
+UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+die() { echo "crew: $*" >&2; exit 2; }
+say() { echo "crew: $*"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+
+load_global() {
+  NOTIFY_CMD="" CREW_HOME="$HOME/agent-crew" STALL_MINUTES=30 CTX_WINDOW=200000
+  [ -f "$CONF/crew.conf" ] && . "$CONF/crew.conf"
+  return 0
+}
+load_crew() {
+  local slug=$1
+  [ -f "$CONF/repos/$slug.conf" ] || die "no crew named $slug"
+  REPO="" MODE=local STICKY=yes; export STICKY; FIXER_ACCOUNT="" REVIEWER_ACCOUNT="" FIXER_MODEL="" REVIEWER_MODEL="" BASE=main PAUSED=no
+  . "$CONF/repos/$slug.conf"
+}
+# session name -> slug and role
+split_session() { SLUG=${1%-*}; ROLE=${1##*-}; [[ "$ROLE" =~ ^(fixer|reviewer)$ ]] || die "not a crew session: $1"; }
+notify_owner() { load_global; if [ -n "$NOTIFY_CMD" ]; then $NOTIFY_CMD "$1" >/dev/null 2>&1 || true; else echo "$1"; fi; }
+token_for() { gh auth token --user "$1" 2>/dev/null || die "gh has no login for $1 (run: gh auth login)"; }
+noreply() { gh api "users/$1" -q '"\(.id)+\(.login)@users.noreply.github.com"'; }
+claude_running() {
+  local tty; tty=$(tmux display -p -t "=$1:" '#{pane_tty}' 2>/dev/null) || return 1
+  ps -o comm= -t "$tty" | grep -qx claude
+}
+transcript() { # session -> path of its conversation file
+  split_session "$1"; load_crew "$SLUG"; load_global
+  local dir="$CREW_HOME/$SLUG/$ROLE" id
+  id=$(cat "$STATE_ROOT/$SLUG/$ROLE/session-id" 2>/dev/null) || return 1
+  echo "$HOME/.claude/projects/$(printf '%s' "$dir" | tr '/.' '--')/$id.jsonl"
+}
+
+# ---------------------------------------------------------------- install
+cmd_install() {
+  need tmux; need gh; need jq; need claude
+  mkdir -p "$CONF/repos" "$STATE_ROOT" "$HOME/.local/bin"
+  ln -sf "$SELF" "$HOME/.local/bin/crew"
+  if [ ! -f "$CONF/crew.conf" ]; then
+    cat > "$CONF/crew.conf" <<'EOF'
+# agent-crew settings (shell syntax)
+# Command that receives alerts and the daily digest as its last argument, e.g. a chat or push script.
+# Empty: they are printed to the journal of the timer that made them.
+NOTIFY_CMD=""
+# Where the crews' clones live.
+CREW_HOME="$HOME/agent-crew"
+# Alert when a busy agent has written nothing for this many minutes.
+STALL_MINUTES=30
+# Context window of your Claude model in tokens (1000000 for 1M-context models); alerts at 90%.
+CTX_WINDOW=200000
+EOF
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    mkdir -p "$UNITS"
+    cat > "$UNITS/agent-crew@.service" <<EOF
+[Unit]
+Description=agent-crew session %i (tmux, resumes the same conversation)
+After=default.target
+
+[Service]
+Type=forking
+ExecStart=$HOME/.local/bin/crew start %i
+ExecStop=/usr/bin/env tmux kill-session -t =%i
+RemainAfterExit=yes
+# The shared tmux server may live in this unit's cgroup; stopping one session must not kill it.
+KillMode=process
+
+[Install]
+WantedBy=default.target
+EOF
+    local job when
+    for job in poll watch digest; do
+      cat > "$UNITS/agent-crew-$job.service" <<EOF
+[Unit]
+Description=agent-crew $job
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.local/bin/crew $job
+EOF
+      case $job in
+        poll) when="OnBootSec=2min
+OnUnitActiveSec=3min" ;;
+        watch) when="OnBootSec=10min
+OnUnitActiveSec=10min" ;;
+        digest) when="OnCalendar=*-*-* 21:00
+Persistent=true" ;;
+      esac
+      printf '[Unit]\nDescription=agent-crew %s timer\n\n[Timer]\n%s\n\n[Install]\nWantedBy=timers.target\n' "$job" "$when" > "$UNITS/agent-crew-$job.timer"
+    done
+    systemctl --user daemon-reload
+    systemctl --user enable --now agent-crew-poll.timer agent-crew-watch.timer agent-crew-digest.timer >/dev/null 2>&1
+    say "installed: ~/.local/bin/crew, systemd units, timers (poll 3 min, watch 10 min, digest 21:00)"
+  else
+    say "installed ~/.local/bin/crew. No systemd here: run 'crew poll' every few minutes and 'crew digest' daily yourself, and use --no-sticky."
+  fi
+  say "settings: $CONF/crew.conf"
+}
+
+# ---------------------------------------------------------------- assign
+render() { # template out: fill {{NAME}} placeholders; values travel as env vars, never through the shell
+  local tpl=$1 out=$2 extra=""
+  [ -n "${RULES_FILE:-}" ] && extra=$(printf '\n## Repo-specific rules\n%s\n' "$(cat "$RULES_FILE")")
+  V_REPO=$REPO V_BASE=$BASE V_SESSION=$SESSION V_OTHER_SESSION=$OTHER V_CLONE=$CLONE V_WT_DIR=$WT \
+  V_STATE_DIR=$SDIR V_FIXER_LOGIN=$FIXER_ACCOUNT V_REVIEWER_LOGIN=$REVIEWER_ACCOUNT \
+  V_APPROVE=$APPROVE V_REQUEST_CHANGES=$REQUEST V_EXTRA_RULES=$extra \
+  python3 - "$tpl" "$out" <<'PY'
+import os, re, sys
+s = open(sys.argv[1]).read()
+s = re.sub(r"\{\{([A-Z_]+)\}\}", lambda m: os.environ.get("V_" + m.group(1), m.group(0)), s)
+left = re.findall(r"\{\{[A-Z_]+\}\}", s)
+if left:
+    sys.exit(f"unfilled placeholders in {sys.argv[1]}: {sorted(set(left))}")
+open(sys.argv[2], "w").write(s)
+PY
+}
+
+github_setup() {
+  local admin_tok rev_tok perm
+  admin_tok=$(token_for "$FIXER_ACCOUNT")
+  # Merge commits only: every PR commit stays in history.
+  GH_TOKEN=$admin_tok gh api -X PATCH "repos/$REPO" -F allow_merge_commit=true -F allow_squash_merge=false \
+    -F allow_rebase_merge=false >/dev/null 2>&1 && say "repo set to merge commits only" \
+    || say "could not change merge settings (needs admin on $REPO); set merge commits only by hand"
+  # The reviewer needs write to merge, tag and release.
+  if [ "$REVIEWER_ACCOUNT" != "$FIXER_ACCOUNT" ]; then
+    rev_tok=$(token_for "$REVIEWER_ACCOUNT")
+    perm=$(GH_TOKEN=$rev_tok gh api "repos/$REPO" -q '.permissions.push' 2>/dev/null || echo false)
+    if [ "$perm" != true ]; then
+      GH_TOKEN=$admin_tok gh api -X PUT "repos/$REPO/collaborators/$REVIEWER_ACCOUNT" -f permission=push >/dev/null \
+        || die "could not add $REVIEWER_ACCOUNT as a collaborator on $REPO"
+      local inv
+      for inv in $(GH_TOKEN=$rev_tok gh api user/repository_invitations -q ".[]|select(.repository.full_name==\"$REPO\")|.id"); do
+        GH_TOKEN=$rev_tok gh api -X PATCH "user/repository_invitations/$inv" >/dev/null
+      done
+      say "gave $REVIEWER_ACCOUNT write on $REPO"
+    fi
+  fi
+  # Labels the crew relies on.
+  local l
+  while IFS='|' read -r l col desc; do
+    GH_TOKEN=$admin_tok gh api "repos/$REPO/labels" -f name="$l" -f color="$col" -f description="$desc" >/dev/null 2>&1 || true
+  done <<'EOF'
+P0|b60205|Critical: broken for users or data at risk, fix now
+P1|d93f0b|High: fix soon
+P2|fbca04|Medium: normal queue
+P3|0e8a16|Low: nice to have
+idea|c5def5|Product idea for the owner to decide on, not work to pick up
+status: needs-info|fef2c0|Waiting for more information
+status: needs-decision|fef2c0|Needs a decision from the owner
+EOF
+}
+
+clone_for() { # account dir
+  local acct=$1 dir=$2
+  if [ ! -d "$dir/.git" ]; then
+    mkdir -p "$(dirname "$dir")"
+    GH_TOKEN=$(token_for "$acct") gh repo clone "$REPO" "$dir" -- -q
+  fi
+  git -C "$dir" config user.name "$acct"
+  git -C "$dir" config user.email "$(noreply "$acct")"
+  git -C "$dir" config credential.https://github.com.helper ''
+  git -C "$dir" config --add credential.https://github.com.helper '!gh auth git-credential'
+}
+
+cmd_assign() {
+  need gh; need jq; need tmux; need python3
+  REPO=${1:-}; shift || true
+  [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "usage: crew assign <owner/repo> [options]"
+  local mode=local sticky=yes slug="" setup=yes
+  FIXER_ACCOUNT="" REVIEWER_ACCOUNT="" FIXER_MODEL="" REVIEWER_MODEL="" RULES_FILE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) mode=$2; shift 2 ;;
+      --sticky) sticky=yes; shift ;;
+      --no-sticky) sticky=no; shift ;;
+      --fixer-account) FIXER_ACCOUNT=$2; shift 2 ;;
+      --reviewer-account) REVIEWER_ACCOUNT=$2; shift 2 ;;
+      --fixer-model) FIXER_MODEL=$2; shift 2 ;;
+      --reviewer-model) REVIEWER_MODEL=$2; shift 2 ;;
+      --rules) RULES_FILE=$(realpath "$2"); shift 2 ;;
+      --slug) slug=$2; shift 2 ;;
+      --no-github-setup) setup=no; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [[ "$mode" =~ ^(local|ci)$ ]] || die "--mode is local or ci"
+  [ -z "$RULES_FILE" ] || [ -f "$RULES_FILE" ] || die "rules file not found"
+  [ -n "$FIXER_ACCOUNT" ] || FIXER_ACCOUNT=$(gh api user -q .login)
+  [ -n "$REVIEWER_ACCOUNT" ] || REVIEWER_ACCOUNT=$FIXER_ACCOUNT
+  token_for "$FIXER_ACCOUNT" >/dev/null; token_for "$REVIEWER_ACCOUNT" >/dev/null
+  BASE=$(GH_TOKEN=$(token_for "$FIXER_ACCOUNT") gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name) \
+    || die "$FIXER_ACCOUNT cannot see $REPO"
+  [ -n "$slug" ] || slug=$(basename "$REPO" | tr 'A-Z_.' 'a-z--')
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "slug must be lowercase letters, digits and hyphens"
+  [ -e "$CONF/repos/$slug.conf" ] && die "a crew named $slug exists; pick another --slug or crew unassign $slug"
+  if [ "$FIXER_ACCOUNT" = "$REVIEWER_ACCOUNT" ]; then
+    APPROVE='Post the review as a comment (`gh pr review N --comment`): GitHub does not let an account approve its own PR, and the fixer uses your account too'
+    REQUEST='Post the review as a comment (`gh pr review N --comment`) and add the `status: changes-requested` label (remove it when you later merge)'
+    say "both agents use $FIXER_ACCOUNT: reviews will be comments, since GitHub does not allow approving your own PR"
+  else
+    APPROVE='Approve (`gh pr review N --approve`)'
+    REQUEST='Request changes (`gh pr review N --request-changes`, inline comments through `gh api repos/'"$REPO"'/pulls/N/reviews` with a `comments` array)'
+  fi
+  [ "$setup" = yes ] && github_setup
+  load_global
+  mkdir -p "$CONF/repos"
+  if [ "$mode" = ci ]; then assign_ci "$slug"; return; fi
+
+  local role
+  for role in fixer reviewer; do
+    SESSION="$slug-$role"; OTHER="$slug-$([ $role = fixer ] && echo reviewer || echo fixer)"
+    CLONE="$CREW_HOME/$slug/$role"; WT="$CREW_HOME/$slug/$role-wt"; SDIR="$STATE_ROOT/$slug/$role"
+    mkdir -p "$SDIR" "$WT"
+    clone_for "$([ $role = fixer ] && echo "$FIXER_ACCOUNT" || echo "$REVIEWER_ACCOUNT")" "$CLONE"
+    render "$ROOT/briefs/$role.md" "$SDIR/brief.md"
+  done
+  echo busy > "$STATE_ROOT/$slug/fixer/status"
+  printf 'REPO=%q\nMODE=local\nSTICKY=%q\nFIXER_ACCOUNT=%q\nREVIEWER_ACCOUNT=%q\nFIXER_MODEL=%q\nREVIEWER_MODEL=%q\nBASE=%q\nPAUSED=no\n' \
+    "$REPO" "$sticky" "$FIXER_ACCOUNT" "$REVIEWER_ACCOUNT" "$FIXER_MODEL" "$REVIEWER_MODEL" "$BASE" > "$CONF/repos/$slug.conf"
+  for role in fixer reviewer; do
+    if [ "$sticky" = yes ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl --user enable --now "agent-crew@$slug-$role" >/dev/null 2>&1
+    else
+      "$SELF" start "$slug-$role"
+    fi
+    accept_trust "$slug-$role"
+  done
+  say "crew $slug is running on $REPO: $slug-fixer ($FIXER_ACCOUNT) and $slug-reviewer ($REVIEWER_ACCOUNT); see: crew status"
+}
+
+accept_trust() { # a folder Claude has not seen stops on the trust prompt; accept it for this folder only
+  local s=$1 screen
+  for _ in $(seq 40); do
+    sleep 1
+    screen=$(tmux capture-pane -p -t "=$s:" 2>/dev/null || true)
+    if grep -q 'Yes, I trust this folder' <<<"$screen"; then
+      tmux send-keys -t "=$s:" Down; sleep 0.5
+      tmux capture-pane -p -t "=$s:" | grep -q '❯ Yes, I trust this folder' && tmux send-keys -t "=$s:" Enter
+      return
+    fi
+    grep -q 'bypass permissions on' <<<"$screen" && return
+  done
+}
+
+assign_ci() {
+  local slug=$1 dir tmp
+  tmp=$(mktemp -d)
+  dir="$tmp/repo"
+  GH_TOKEN=$(token_for "$FIXER_ACCOUNT") gh repo clone "$REPO" "$dir" -- -q
+  git -C "$dir" checkout -q -b agent-crew/setup
+  mkdir -p "$dir/.github/workflows" "$dir/.github/agent-crew"
+  local role
+  for role in fixer reviewer; do
+    SESSION="the $role"; OTHER="the $([ $role = fixer ] && echo reviewer || echo fixer)"
+    CLONE="the checked-out repository"; WT="the runner's temp folder"; SDIR=".github/agent-crew (read only in CI)"
+    render "$ROOT/briefs/$role.md" "$dir/.github/agent-crew/$role.md"
+    sed -e "s#{{BASE}}#$BASE#g" "$ROOT/ci/$role.yml" > "$dir/.github/workflows/agent-crew-$role.yml"
+  done
+  cp "$ROOT/ci/README.md" "$dir/.github/agent-crew/README.md"
+  git -C "$dir" add .github
+  git -C "$dir" -c user.name="$FIXER_ACCOUNT" -c user.email="$(noreply "$FIXER_ACCOUNT")" commit -q -m "ci: add agent-crew fixer and reviewer workflows"
+  GH_TOKEN=$(token_for "$FIXER_ACCOUNT") git -C "$dir" -c credential.helper= -c 'credential.helper=!gh auth git-credential' push -q -u origin agent-crew/setup
+  GH_TOKEN=$(token_for "$FIXER_ACCOUNT") gh pr create --repo "$REPO" --head agent-crew/setup --base "$BASE" \
+    --title "ci: add agent-crew fixer and reviewer workflows" --body-file "$ROOT/ci/README.md"
+  printf 'REPO=%q\nMODE=ci\nFIXER_ACCOUNT=%q\nREVIEWER_ACCOUNT=%q\nBASE=%q\nPAUSED=no\n' "$REPO" "$FIXER_ACCOUNT" "$REVIEWER_ACCOUNT" "$BASE" > "$CONF/repos/$slug.conf"
+  say "opened the setup PR above. Before merging it, add the repository secrets listed in its description."
+}
+
+# ---------------------------------------------------------------- sessions
+cmd_start() {
+  local s=${1:-}; split_session "$s"; load_crew "$SLUG"; load_global
+  local dir="$CREW_HOME/$SLUG/$ROLE" sdir="$STATE_ROOT/$SLUG/$ROLE" acct model id mode up
+  acct=$([ "$ROLE" = fixer ] && echo "$FIXER_ACCOUNT" || echo "$REVIEWER_ACCOUNT")
+  model=$([ "$ROLE" = fixer ] && echo "$FIXER_MODEL" || echo "$REVIEWER_MODEL")
+  tmux has-session -t "=$s" 2>/dev/null && exit 0
+  id=$(cat "$sdir/session-id" 2>/dev/null || true)
+  local rollover=no
+  if [ -f "$sdir/rollover" ]; then
+    # `crew rollover` asked for a fresh conversation; the old one stays on disk.
+    [ -n "$id" ] && printf '%s\t%s\n' "$(date '+%F %T')" "$id" >> "$sdir/previous-sessions.tsv"
+    rm -f "$sdir/rollover" "$sdir/.rollover-notice"
+    id=""; rollover=yes
+  fi
+  if [ -n "$id" ] && [ -f "$(transcript "$s")" ]; then
+    up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 99999)
+    if [ "$up" -lt 600 ]; then
+      printf 'MACHINE REBOOTED at %s. Re-read your state file and carry on from where you stopped.' "$(date '+%F %R')" > "$sdir/first-msg"
+    else
+      printf 'SESSION RESTARTED at %s (the machine stayed up). Re-read your state file and carry on from where you stopped.' "$(date '+%F %R')" > "$sdir/first-msg"
+    fi
+    mode="--resume $id"
+  else
+    id=$(cat /proc/sys/kernel/random/uuid)
+    echo "$id" > "$sdir/session-id"
+    cp "$sdir/brief.md" "$sdir/first-msg"
+    if [ "$rollover" = yes ]; then
+      printf '\n\n---\nROLLOVER (%s): this is a fresh conversation. Your previous one was rolled over to keep your context small; it is saved on disk. Do NOT do the "Begin now" steps above. Read %s/state.md first: it is your memory. Re-check GitHub for anything that changed, then carry on from where state.md says you stopped.\n' \
+        "$(date '+%F %R')" "$sdir" >> "$sdir/first-msg"
+    fi
+    mode="--session-id $id"
+  fi
+  local flags="--dangerously-skip-permissions --remote-control $s --name $s"
+  [ -n "$model" ] && flags="--model $model $flags"
+  exec tmux new-session -d -s "$s" -c "$dir" \
+    "export PATH=\"\$HOME/.local/bin:\$PATH\" AGENT_CREW_SESSION=$s; export GH_TOKEN=\$(gh auth token --user $acct); for i in \$(seq 30); do getent hosts api.anthropic.com >/dev/null && break; sleep 2; done; claude $flags $mode \"\$(cat '$sdir/first-msg')\"; exec \${SHELL:-bash} -l"
+}
+
+type_into() { tmux send-keys -t "=$1:" -l "$2"; sleep 0.5; tmux send-keys -t "=$1:" Enter; }
+
+cmd_notify() { # session text...  (fixer: only when idle; it reads GitHub after every task)
+  local s=$1; shift; local msg="$*"
+  split_session "$s"; load_crew "$SLUG"
+  [ "$PAUSED" = yes ] && return 0
+  tmux has-session -t "=$s" 2>/dev/null || return 0
+  claude_running "$s" || return 0
+  if [ "$ROLE" = fixer ]; then
+    local st="$STATE_ROOT/$SLUG/fixer/status"
+    [ "$(cat "$st" 2>/dev/null)" = idle ] || return 0
+    echo busy > "$st"
+  fi
+  type_into "$s" "$msg"
+}
+
+cmd_rollover() { # [session]: fresh conversation from the brief + state.md, a few seconds from now
+  local s=${1:-${AGENT_CREW_SESSION:-}}
+  [ -n "$s" ] || die "usage: crew rollover <session> (or run it inside a crew session)"
+  split_session "$s"; load_crew "$SLUG"
+  local sdir="$STATE_ROOT/$SLUG/$ROLE"
+  date '+%F %T' > "$sdir/rollover"
+  if [ "$STICKY" = yes ] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --quiet --collect --on-active=5 /usr/bin/env systemctl --user restart "agent-crew@$s"
+  else
+    # Not managed by systemd: a detached helper stops the session and starts it again.
+    nohup bash -c "sleep 5; tmux kill-session -t '=$s' 2>/dev/null; '$SELF' start '$s'" >/dev/null 2>&1 &
+  fi
+  say "$s will restart into a fresh conversation in 5 seconds"
+}
+
+set_paused() {
+  local slug=$1 v=$2
+  load_crew "$slug"
+  sed -i "s/^PAUSED=.*/PAUSED=$v/" "$CONF/repos/$slug.conf"
+  local role
+  for role in fixer reviewer; do
+    claude_running "$slug-$role" || continue
+    if [ "$v" = yes ]; then type_into "$slug-$role" "PAUSE: finish the step you are on, then wait for RESUME."
+    else type_into "$slug-$role" "RESUME: carry on with your queue."; fi
+  done
+  say "$slug $([ "$v" = yes ] && echo paused || echo resumed)"
+}
+
+cmd_unassign() {
+  local slug=$1 role; load_crew "$slug"
+  for role in fixer reviewer; do
+    systemctl --user disable --now "agent-crew@$slug-$role" >/dev/null 2>&1 || true
+    tmux kill-session -t "=$slug-$role" 2>/dev/null || true
+  done
+  mv "$CONF/repos/$slug.conf" "$CONF/repos/$slug.conf.unassigned-$(date +%Y%m%d%H%M%S)"
+  say "unassigned $slug; clones in $CREW_HOME/$slug and state in $STATE_ROOT/$slug are kept"
+}
+
+ctx_tokens() { # last assistant turn's input tokens = how full the context is
+  local f; f=$(transcript "$1" 2>/dev/null) || { echo 0; return; }
+  [ -f "$f" ] || { echo 0; return; }
+  tail -n 400 "$f" | jq -R -s -r '[split("\n")[]|fromjson? |select(.type=="assistant")|.message.usage|select(.)|(.input_tokens+(.cache_read_input_tokens//0)+(.cache_creation_input_tokens//0))]|last // 0'
+}
+
+cmd_status() {
+  load_global; shopt -s nullglob
+  printf '%-28s %-8s %-9s %-7s %-8s %s\n' SESSION MODE STATE IDLE_FOR CONTEXT LINK
+  local f slug role s st age ctx link tf
+  for f in "$CONF"/repos/*.conf; do
+    slug=$(basename "$f" .conf); load_crew "$slug"
+    if [ "$MODE" = ci ]; then printf '%-28s %-8s %s\n' "$slug" ci "runs in GitHub Actions on $REPO"; continue; fi
+    for role in fixer reviewer; do
+      s="$slug-$role"
+      if claude_running "$s"; then
+        st=running; [ "$role" = fixer ] && st=$(cat "$STATE_ROOT/$slug/fixer/status" 2>/dev/null || echo "?")
+        [ "$PAUSED" = yes ] && st=paused
+        tf=$(transcript "$s"); age=$(( ($(date +%s) - $(stat -c %Y "$tf" 2>/dev/null || date +%s)) / 60 ))m
+        ctx=$(( $(ctx_tokens "$s") * 100 / CTX_WINDOW ))%
+        link=$(tmux capture-pane -p -S -3000 -t "=$s:" | grep -o 'https://claude.ai/code/session_[A-Za-z0-9]*' | tail -1)
+      else st=down age=- ctx=- link=-; fi
+      printf '%-28s %-8s %-9s %-7s %-8s %s\n' "$s" "$MODE" "$st" "$age" "$ctx" "${link:--}"
+    done
+  done
+}
+
+# ---------------------------------------------------------------- timers
+cmd_poll() { # new issues -> fixer (when idle); new PR heads -> reviewer
+  load_global; shopt -s nullglob
+  local f slug tok sf last items
+  for f in "$CONF"/repos/*.conf; do
+    slug=$(basename "$f" .conf); load_crew "$slug"
+    [ "$MODE" = local ] && [ "$PAUSED" != yes ] || continue
+    tok=$(gh auth token --user "$FIXER_ACCOUNT" 2>/dev/null) || continue
+    sf="$STATE_ROOT/$slug/poll.json"; [ -f "$sf" ] || echo '{"last_issue":null,"heads":{}}' > "$sf"
+    # Issues: anything numbered above the last one seen.
+    items=$(GH_TOKEN=$tok gh api "repos/$REPO/issues?state=open&sort=created&direction=desc&per_page=30" 2>/dev/null) || continue
+    last=$(jq -r '.last_issue // empty' "$sf")
+    local newest; newest=$(jq '[.[].number]|max // 0' <<<"$items")
+    if [ -n "$last" ]; then
+      local n; for n in $(jq -r --argjson l "$last" '[.[]|select(.number>$l and (has("pull_request")|not))|.number]|sort|.[]' <<<"$items"); do
+        cmd_notify "$slug-fixer" "NEW WORK: new issue #$n on $REPO. Pick your next task by the Order rules."
+      done
+    fi
+    # Changes requested on the fixer's PRs, or new heads for the reviewer.
+    local pulls heads; pulls=$(GH_TOKEN=$tok gh api "repos/$REPO/pulls?state=open&per_page=100" 2>/dev/null) || continue
+    heads=$(jq -c '[.[]|select(.draft|not)|{key:(.number|tostring),value:{sha:.head.sha,title:.title,by:.user.login,url:.html_url}}]|from_entries' <<<"$pulls")
+    if [ -n "$last" ]; then
+      jq -r --slurpfile st "$sf" 'to_entries[]|select(($st[0].heads[.key]) != .value.sha)|"\(.key)\t\(.value.sha[0:12])\t\(.value.by)\t\(.value.title)\t\(.value.url)"' <<<"$heads" |
+      while IFS=$'\t' read -r num sha by title url; do
+        cmd_notify "$slug-reviewer" "REVIEW PR #$num (head $sha) by $by: $title $url"
+      done
+    fi
+    # The fixer, when idle, also wakes for its own PRs with changes requested, but only when that
+    # set changed (a new review or a new head), so an unfixable one does not wake it every poll.
+    local crq; crq=$(GH_TOKEN=$tok gh pr list --repo "$REPO" --author "$FIXER_ACCOUNT" \
+      --search "review:changes-requested" --json number,headRefOid,reviews \
+      -q '[.[]|"\(.number):\(.headRefOid[0:12]):\(.reviews|length)"]|sort|join(",")' 2>/dev/null || echo "")
+    if [ -n "$crq" ] && [ "$crq" != "$(jq -r '.changes_requested // ""' "$sf")" ]; then
+      cmd_notify "$slug-fixer" "NEW WORK: your PRs on $REPO have new changes requested. Pick your next task by the Order rules."
+    fi
+    jq --argjson n "$newest" --argjson h "$heads" --arg c "$crq" \
+      '.last_issue = ([.last_issue // 0, $n]|max) | .heads = ($h|map_values(.sha)) | .changes_requested = $c' "$sf" > "$sf.tmp" && mv "$sf.tmp" "$sf"
+  done
+}
+
+alert_once() { # key text: at most once every 2 hours per key
+  local key=$1 text=$2 af="$STATE_ROOT/alerts.json" now; now=$(date +%s)
+  [ -f "$af" ] || echo '{}' > "$af"
+  local prev; prev=$(jq -r --arg k "$key" '.[$k] // 0' "$af")
+  [ $((now - prev)) -lt 7200 ] && return 0
+  jq --arg k "$key" --argjson t "$now" '.[$k]=$t' "$af" > "$af.tmp" && mv "$af.tmp" "$af"
+  notify_owner "$text"
+}
+
+cmd_watch() { # stuck, down, waiting on a prompt, or context nearly full
+  load_global; shopt -s nullglob
+  local f slug role s tf idle pct screen
+  for f in "$CONF"/repos/*.conf; do
+    slug=$(basename "$f" .conf); load_crew "$slug"
+    [ "$MODE" = local ] && [ "$PAUSED" != yes ] || continue
+    for role in fixer reviewer; do
+      s="$slug-$role"
+      if ! claude_running "$s"; then alert_once "$s-down" "agent-crew: $s is not running. Restart it: systemctl --user restart agent-crew@$s"; continue; fi
+      screen=$(tmux capture-pane -p -t "=$s:")
+      if grep -qE 'Do you want to|Allow Claude to' <<<"$screen"; then
+        alert_once "$s-prompt" "agent-crew: $s is waiting on a permission prompt. Open it: tmux attach -t $s"
+      fi
+      tf=$(transcript "$s"); idle=$(( ($(date +%s) - $(stat -c %Y "$tf" 2>/dev/null || date +%s)) / 60 ))
+      if [ "$idle" -ge "$STALL_MINUTES" ] && { { [ "$role" = fixer ] && [ "$(cat "$STATE_ROOT/$slug/fixer/status" 2>/dev/null)" = busy ]; } || grep -q 'esc to interrupt' <<<"$screen"; }; then
+        alert_once "$s-stall" "agent-crew: $s is busy but has written nothing for $idle min. Check it: tmux attach -t $s"
+      fi
+      pct=$(( $(ctx_tokens "$s") * 100 / CTX_WINDOW ))
+      [ "$pct" -ge 90 ] && alert_once "$s-ctx" "agent-crew: $s context is $pct% full. It will compact soon; check that its state file is current."
+    done
+  done
+}
+
+cmd_digest() {
+  load_global; shopt -s nullglob
+  local f slug tok since out
+  since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+  for f in "$CONF"/repos/*.conf; do
+    slug=$(basename "$f" .conf); load_crew "$slug"
+    tok=$(gh auth token --user "$FIXER_ACCOUNT" 2>/dev/null) || continue
+    out=$(GH_TOKEN=$tok REPO=$REPO SINCE=$since python3 - <<'PY'
+import json, os, subprocess, datetime as dt
+repo, since = os.environ["REPO"], os.environ["SINCE"]
+def gh(*a):
+    r = subprocess.run(["gh", *a], capture_output=True, text=True)
+    return json.loads(r.stdout or "[]")
+merged = gh("pr", "list", "--repo", repo, "--state", "merged", "--search", f"merged:>={since}", "--json", "number,title")
+opened = gh("issue", "list", "--repo", repo, "--state", "all", "--search", f"created:>={since}", "--json", "number")
+closed = gh("issue", "list", "--repo", repo, "--state", "closed", "--search", f"closed:>={since}", "--json", "number")
+prs = gh("pr", "list", "--repo", repo, "--json", "number,title,createdAt,reviewDecision")
+decide = gh("issue", "list", "--repo", repo, "--label", "status: needs-decision", "--json", "number,title")
+rels = [r for r in gh("release", "list", "--repo", repo, "--json", "tagName,publishedAt", "--limit", "5") if (r.get("publishedAt") or "") >= since]
+now = dt.datetime.now(dt.timezone.utc)
+lines = [f"*agent-crew {repo}*, last 24h"]
+lines.append(f"Merged {len(merged)}" + (": " + ", ".join(f"#{p['number']}" for p in merged[:15]) if merged else ""))
+if rels: lines.append("Released " + ", ".join(r["tagName"] for r in rels))
+lines.append(f"Issues opened {len(opened)}, closed {len(closed)}")
+if prs:
+    lines.append(f"Open PRs {len(prs)}:")
+    for p in sorted(prs, key=lambda p: p["createdAt"])[:10]:
+        age = (now - dt.datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))).days
+        state = {"CHANGES_REQUESTED": "changes requested", "APPROVED": "approved"}.get(p.get("reviewDecision") or "", "waiting for review")
+        lines.append(f"- #{p['number']} {state}, {age}d: {p['title'][:60]}")
+if decide:
+    lines.append("Waiting on your decision:")
+    lines += [f"- #{i['number']} {i['title'][:70]}" for i in decide[:10]]
+print("\n".join(lines))
+PY
+)
+    if [ "$MODE" = local ]; then
+      local role st; for role in fixer reviewer; do
+        st=down; claude_running "$slug-$role" && st=running
+        [ "$role" = fixer ] && [ "$st" = running ] && st=$(cat "$STATE_ROOT/$slug/fixer/status" 2>/dev/null || echo running)
+        out="$out"$'\n'"$slug-$role: $st"
+      done
+    fi
+    notify_owner "$out"
+  done
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  assign) shift; cmd_assign "$@" ;;
+  start) cmd_start "${2:-}" ;;
+  notify) shift; [ $# -ge 2 ] || die "usage: crew notify <session> <text>"; cmd_notify "$@" ;;
+  status) cmd_status ;;
+  pause) set_paused "${2:?slug}" yes ;;
+  resume) set_paused "${2:?slug}" no ;;
+  unassign) cmd_unassign "${2:?slug}" ;;
+  rollover) cmd_rollover "${2:-}" ;;
+  poll) cmd_poll ;;
+  watch) cmd_watch ;;
+  digest) cmd_digest ;;
+  *) sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

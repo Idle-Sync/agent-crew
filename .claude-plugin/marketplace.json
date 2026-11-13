@@ -1,0 +1,18 @@
+{
+  "name": "agent-crew",
+  "owner": {
+    "name": "Sayantan Ghosh",
+    "url": "https://idlesync.in"
+  },
+  "metadata": {
+    "description": "agent-crew: a fixer and a reviewer agent that maintain a GitHub repo"
+  },
+  "plugins": [
+    {
+      "name": "agent-crew",
+      "source": "./",
+      "description": "An issue fixer and a PR reviewer that maintain a GitHub repo, locally or in GitHub Actions.",
+      "version": "0.1.0"
+    }
+  ]
+}
