@@ -23,8 +23,13 @@ query($owner: String!, $name: String!, $after: String) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number authorAssociation lastEditedAt
-        timelineItems(itemTypes: [LABELED_EVENT], last: 50) {
-          nodes { ... on LabeledEvent { createdAt label { name } actor { login } } }
+        labels(first: 100) { nodes { name } }
+        timelineItems(itemTypes: [LABELED_EVENT, RENAMED_TITLE_EVENT], last: 100) {
+          nodes {
+            __typename
+            ... on LabeledEvent { createdAt label { name } actor { login } }
+            ... on RenamedTitleEvent { createdAt actor { login } }
+          }
         }
       }
     }
@@ -53,11 +58,26 @@ def can_write(repo, login):
 def eligible(issue, can_write_fn):
     if issue["authorAssociation"] in TRUSTED_AUTHORS:
         return True
-    approvals = [e["createdAt"] for e in issue["timelineItems"]["nodes"]
-                 if e and e["label"]["name"] == APPROVE_LABEL and e.get("actor")
-                 and can_write_fn(e["actor"]["login"])]
-    # ISO 8601 timestamps in UTC compare correctly as strings.
-    return bool(approvals) and (issue["lastEditedAt"] is None or issue["lastEditedAt"] <= max(approvals))
+    # The label must be on the issue now (a removed approval no longer counts) ...
+    if APPROVE_LABEL not in {l["name"] for l in issue["labels"]["nodes"]}:
+        return False
+    events = [e for e in issue["timelineItems"]["nodes"] if e]
+    adds = [e for e in events if e["__typename"] == "LabeledEvent" and e["label"]["name"] == APPROVE_LABEL]
+    if not adds:
+        return False
+    # ... and whoever added it most recently must have write access; that is the approval.
+    last_add = max(adds, key=lambda e: e["createdAt"])
+    if not (last_add.get("actor") and can_write_fn(last_add["actor"]["login"])):
+        return False
+    approved = last_add["createdAt"]  # ISO 8601 UTC: string order is time order
+    # Any change to the text after approval, other than a title change by a writer, voids it.
+    if issue["lastEditedAt"] is not None and issue["lastEditedAt"] > approved:
+        return False
+    for e in events:
+        if e["__typename"] == "RenamedTitleEvent" and e["createdAt"] > approved:
+            if not (e.get("actor") and can_write_fn(e["actor"]["login"])):
+                return False
+    return True
 
 
 def main():
