@@ -20,8 +20,7 @@ permissions:
 
 jobs:
   fix:
-    # Issue events only from people with access to the repo, or issues a maintainer approved with
-    # the crew-approved label: issue text is untrusted input to an agent that holds a write token.
+    # Quick pre-filter on issue events; the eligible step below makes the real decision.
     if: >-
       (github.event_name != 'pull_request_review' || github.event.review.state == 'changes_requested') &&
       (github.event_name != 'issues' ||
@@ -41,7 +40,21 @@ jobs:
           login=$(gh api user -q .login)
           git config --global user.name "$login"
           git config --global user.email "$(gh api user -q '"\(.id)+\(.login)@users.noreply.github.com"')"
-      - uses: anthropics/claude-code-action@v1
+      # Trust is decided here, in code, before the agent reads any issue text: issues from people
+      # with access, or approved with crew-approved by someone with write access and not edited since.
+      - name: eligible issues
+        id: eligible
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          list=$(python3 .github/agent-crew/eligible-issues.py "$GITHUB_REPOSITORY" | tr '\n' ' ')
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          run=yes
+          if [ -n "$ISSUE" ] && ! grep -qw "$ISSUE" <<<"$list"; then run=no; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "eligible: ${list:-none}; run: $run"
+      - if: steps.eligible.outputs.run == 'yes'
+        uses: anthropics/claude-code-action@v1
         with:
           github_token: ${{ secrets.CREW_FIXER_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -50,6 +63,8 @@ jobs:
           prompt: |
             Read .github/agent-crew/fixer.md and follow it, with these changes for GitHub Actions:
             there is no state file, no status file and no terminal messages, so skip those parts;
-            your queue is GitHub. Do exactly one task (the first one the Order section picks),
-            push it as a PR or as a fix on your PR branch, then stop. If there is no task, stop.
+            your queue is GitHub. The only issues you may work on are: ${{ steps.eligible.outputs.list || 'none' }}
+            (already checked; do not take any other issue). Do exactly one task (the first one the
+            Order section picks among those, or one of your PRs with changes requested), push it as a
+            PR or as a fix on your PR branch, then stop. If there is no task, stop.
             This run was triggered by: ${{ github.event_name }}.
