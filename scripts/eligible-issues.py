@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Print the open issues of a repo that the agent-crew may work on, one number per line.
 
-  eligible-issues.py <owner/repo>        (uses `gh`; GH_TOKEN selects the account)
+  eligible-issues.py <owner/repo>                 (uses `gh`; GH_TOKEN selects the account)
+  eligible-issues.py <owner/repo> --show <number>  the issue as the crew may read it: title, body and
+                                                   only the comments from trusted people
 
 An issue is eligible when
   - its author is the repo owner, an org member or a collaborator, or
   - someone with write access (write, maintain or admin) added the `crew-approved` label,
     and the issue text has not been edited since that label was added.
 Issue text is untrusted input to an agent that holds a write token, so trust is decided
-here, in code, before the agent reads anything.
+here, in code, before the agent reads anything. --show refuses issues that are not eligible and
+leaves out comments from anyone who is not the owner, a member, a collaborator or a writer.
 """
 import json
 import subprocess
@@ -80,7 +83,49 @@ def eligible(issue, can_write_fn):
     return True
 
 
+SHOW_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      number title body state authorAssociation lastEditedAt
+      labels(first: 100) { nodes { name } }
+      timelineItems(itemTypes: [LABELED_EVENT, RENAMED_TITLE_EVENT], last: 100) {
+        nodes {
+          __typename
+          ... on LabeledEvent { createdAt label { name } actor { login } }
+          ... on RenamedTitleEvent { createdAt actor { login } }
+        }
+      }
+      comments(last: 100) { nodes { createdAt authorAssociation author { login } body } }
+    }
+  }
+}"""
+
+
+def show(repo, number):
+    owner, name = repo.split("/", 1)
+    issue = json.loads(gh("api", "graphql", "-f", f"query={SHOW_QUERY}", "-F", f"owner={owner}",
+                          "-F", f"name={name}", "-F", f"number={number}"))["data"]["repository"]["issue"]
+    writer = lambda login: can_write(repo, login)
+    if not issue or not eligible(issue, writer):
+        sys.exit(f"#{number} is not an issue the crew may work on")
+    print(f"# #{issue['number']} {issue['title']}\n")
+    print(f"labels: {', '.join(l['name'] for l in issue['labels']['nodes']) or 'none'}\n")
+    print(issue["body"] or "(no description)")
+    hidden = 0
+    for c in issue["comments"]["nodes"]:
+        login = (c.get("author") or {}).get("login")
+        if c["authorAssociation"] in TRUSTED_AUTHORS or (login and writer(login)):
+            print(f"\n## comment by {login} ({c['createdAt']})\n\n{c['body']}")
+        else:
+            hidden += 1
+    if hidden:
+        print(f"\n({hidden} comment(s) from people without access to the repo are not shown)")
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[2] == "--show" and sys.argv[3].isdigit():
+        return show(sys.argv[1], int(sys.argv[3]))
     if len(sys.argv) != 2 or "/" not in sys.argv[1]:
         sys.exit(__doc__)
     repo = sys.argv[1]

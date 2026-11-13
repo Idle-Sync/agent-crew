@@ -18,6 +18,7 @@
 #   crew unassign <slug>             stop a local crew; clones and state are kept
 #   crew rollover [session]          continue a session in a fresh conversation (brief + state.md)
 #   crew eligible [slug]             issue numbers the fixer may work on (trust decided in code)
+#   crew issue <number>              that issue as the fixer may read it: title, body, trusted comments
 #   crew poll | crew watch | crew digest     run by the systemd timers
 set -euo pipefail
 
@@ -134,7 +135,7 @@ render() { # template out: fill {{NAME}} placeholders; values travel as env vars
   [ -n "${RULES_FILE:-}" ] && extra=$(printf '\n## Repo-specific rules\n%s\n' "$(cat "$RULES_FILE")")
   V_REPO=$REPO V_BASE=$BASE V_SESSION=$SESSION V_OTHER_SESSION=$OTHER V_CLONE=$CLONE V_WT_DIR=$WT \
   V_STATE_DIR=$SDIR V_FIXER_LOGIN=$FIXER_ACCOUNT V_REVIEWER_LOGIN=$REVIEWER_ACCOUNT \
-  V_APPROVE=$APPROVE V_REQUEST_CHANGES=$REQUEST V_EXTRA_RULES=$extra V_ELIGIBLE_CMD=$ELIGIBLE_CMD \
+  V_APPROVE=$APPROVE V_REQUEST_CHANGES=$REQUEST V_EXTRA_RULES=$extra V_ELIGIBLE_CMD=$ELIGIBLE_CMD V_ISSUE_CMD=$ISSUE_CMD \
   python3 - "$tpl" "$out" <<'PY'
 import os, re, sys
 s = open(sys.argv[1]).read()
@@ -245,7 +246,7 @@ cmd_assign() {
     CLONE="$CREW_HOME/$slug/$role"; WT="$CREW_HOME/$slug/$role-wt"; SDIR="$STATE_ROOT/$slug/$role"
     mkdir -p "$SDIR" "$WT"
     clone_for "$([ $role = fixer ] && echo "$FIXER_ACCOUNT" || echo "$REVIEWER_ACCOUNT")" "$CLONE"
-    ELIGIBLE_CMD="crew eligible $slug"
+    ELIGIBLE_CMD="crew eligible $slug"; ISSUE_CMD="crew issue"
     render "$ROOT/briefs/$role.md" "$SDIR/brief.md"
   done
   echo busy > "$STATE_ROOT/$slug/fixer/status"
@@ -287,7 +288,7 @@ assign_ci() {
   for role in fixer reviewer; do
     SESSION="the $role"; OTHER="the $([ $role = fixer ] && echo reviewer || echo fixer)"
     CLONE="the checked-out repository"; WT="the runner's temp folder"; SDIR=".github/agent-crew (read only in CI)"
-    ELIGIBLE_CMD="python3 .github/agent-crew/eligible-issues.py $REPO"
+    ELIGIBLE_CMD="python3 .github/agent-crew/eligible-issues.py $REPO"; ISSUE_CMD="python3 .github/agent-crew/eligible-issues.py $REPO --show"
     render "$ROOT/briefs/$role.md" "$dir/.github/agent-crew/$role.md"
     sed -e "s#{{BASE}}#$BASE#g" "$ROOT/ci/$role.yml" > "$dir/.github/workflows/agent-crew-$role.yml"
   done
@@ -362,6 +363,13 @@ cmd_eligible() { # [session|slug]: issue numbers the fixer may work on, decided 
   [ -n "$s" ] || die "usage: crew eligible <slug> (or run it inside a crew session)"
   slug=${s%-fixer}; slug=${slug%-reviewer}; load_crew "$slug"
   GH_TOKEN=$(token_for "$FIXER_ACCOUNT") python3 "$ROOT/scripts/eligible-issues.py" "$REPO"
+}
+
+cmd_issue() { # <number>: an issue as the fixer may read it (title, body, trusted comments only)
+  local n=${1:-} s=${AGENT_CREW_SESSION:-} slug
+  [[ "$n" =~ ^[0-9]+$ ]] && [ -n "$s" ] || die "usage: crew issue <number> (inside a crew session)"
+  slug=${s%-fixer}; slug=${slug%-reviewer}; load_crew "$slug"
+  python3 "$ROOT/scripts/eligible-issues.py" "$REPO" --show "$n"
 }
 
 cmd_rollover() { # [session]: fresh conversation from the brief + state.md, a few seconds from now
@@ -563,8 +571,9 @@ case "${1:-}" in
   unassign) cmd_unassign "${2:?slug}" ;;
   rollover) cmd_rollover "${2:-}" ;;
   eligible) cmd_eligible "${2:-}" ;;
+  issue) cmd_issue "${2:-}" ;;
   poll) cmd_poll ;;
   watch) cmd_watch ;;
   digest) cmd_digest ;;
-  *) sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,26p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
