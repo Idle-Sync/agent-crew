@@ -20,7 +20,13 @@ permissions:
 
 jobs:
   fix:
-    if: github.event_name != 'pull_request_review' || github.event.review.state == 'changes_requested'
+    # Issue events only from people with access to the repo, or issues a maintainer approved with
+    # the crew-approved label: issue text is untrusted input to an agent that holds a write token.
+    if: >-
+      (github.event_name != 'pull_request_review' || github.event.review.state == 'changes_requested') &&
+      (github.event_name != 'issues' ||
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association) ||
+       contains(github.event.issue.labels.*.name, 'crew-approved'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:

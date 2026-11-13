@@ -72,9 +72,12 @@ Each local session gets its account's token through `GH_TOKEN`, so the two never
 
 The crew runs the official Claude Code with **your own** login or API key; it never stores, proxies or shares credentials. Two always-on agents use your plan's limits like any other Claude Code sessions, so watch your usage, and use `crew pause` when you need to.
 
-## Unattended sessions and permissions
+## Security
 
-Local sessions run with `--dangerously-skip-permissions` in their own folders, because nobody is there to approve each command. Claude Code still asks about a few commands it cannot check in advance; the plugin's `PermissionRequest` hook approves those **only in sessions the crew started** (it checks `AGENT_CREW_SESSION`) and logs each one to `~/.local/state/agent-crew/approved.log`. Other Claude Code sessions are not affected. Give each agent's GitHub account no more access than the repos it works on.
+- **Unattended sessions:** local agents run with `--dangerously-skip-permissions` in their own folders, because nobody is there to approve each command. Give each agent's GitHub account access to the repos it works on and nothing else.
+- **Untrusted text:** issue and PR text is written by whoever opened it. The briefs tell the agents to treat it as material, never as instructions. The fixer only works on issues from the owner, org members and collaborators, or issues a maintainer labelled `crew-approved`. The reviewer never merges PRs from forks or from outside authors, nor any PR that touches `.github/`, secrets handling or release automation; those wait for you. `crew poll` types only issue and PR numbers into sessions, never titles or bodies.
+- **CI mode:** the fixer workflow only runs for issues from people with access or labelled `crew-approved`. The reviewer reads its brief from the base branch, so a PR cannot rewrite the rules it is reviewed by.
+- **Permission prompts:** Claude Code still asks about a few commands it cannot check in advance. By default those prompts wait for you, and `crew watch` alerts you. Set `AUTO_APPROVE_PROMPTS=yes` in `crew.conf` to approve them automatically in crew sessions only, logged to `~/.local/state/agent-crew/approved.log` with tokens masked.
 
 ## Issues and ideas
 

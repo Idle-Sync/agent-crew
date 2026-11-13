@@ -74,6 +74,10 @@ CREW_HOME="$HOME/agent-crew"
 STALL_MINUTES=30
 # Context window of your Claude model in tokens (1000000 for 1M-context models); alerts at 90%.
 CTX_WINDOW=200000
+# yes: approve the few permission prompts Claude Code still shows in crew sessions, so an
+# unattended agent does not stall (logged to ~/.local/state/agent-crew/approved.log). no: they wait
+# for you and `crew watch` alerts you. Only turn this on if you accept that trade-off.
+AUTO_APPROVE_PROMPTS=no
 EOF
   fi
   if command -v systemctl >/dev/null 2>&1; then
@@ -172,6 +176,7 @@ P1|d93f0b|High: fix soon
 P2|fbca04|Medium: normal queue
 P3|0e8a16|Low: nice to have
 idea|c5def5|Product idea for the owner to decide on, not work to pick up
+crew-approved|0e8a16|A maintainer approved this issue for the crew to work on
 status: needs-info|fef2c0|Waiting for more information
 status: needs-decision|fef2c0|Needs a decision from the owner
 EOF
@@ -433,11 +438,15 @@ cmd_poll() { # new issues -> fixer (when idle); new PR heads -> reviewer
     fi
     # Changes requested on the fixer's PRs, or new heads for the reviewer.
     local pulls heads; pulls=$(GH_TOKEN=$tok gh api "repos/$REPO/pulls?state=open&per_page=100" 2>/dev/null) || continue
-    heads=$(jq -c '[.[]|select(.draft|not)|{key:(.number|tostring),value:{sha:.head.sha,title:.title,by:.user.login,url:.html_url}}]|from_entries' <<<"$pulls")
+    # Only PRs from branches in this repo (not forks), and only the number and commit go into the
+    # session: titles and bodies are written by whoever opened the PR, so the agent reads them
+    # itself as data instead of having them typed in as instructions.
+    heads=$(jq -c --arg r "$REPO" '[.[]|select((.draft|not) and .head.repo.full_name == $r)|{key:(.number|tostring),value:{sha:.head.sha}}]|from_entries' <<<"$pulls")
     if [ -n "$last" ]; then
-      jq -r --slurpfile st "$sf" 'to_entries[]|select(($st[0].heads[.key]) != .value.sha)|"\(.key)\t\(.value.sha[0:12])\t\(.value.by)\t\(.value.title)\t\(.value.url)"' <<<"$heads" |
-      while IFS=$'\t' read -r num sha by title url; do
-        cmd_notify "$slug-reviewer" "REVIEW PR #$num (head $sha) by $by: $title $url"
+      jq -r --slurpfile st "$sf" 'to_entries[]|select(($st[0].heads[.key]) != .value.sha)|"\(.key)\t\(.value.sha[0:12])"' <<<"$heads" |
+      while IFS=$'\t' read -r num sha; do
+        [[ "$num" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]+$ ]] || continue
+        cmd_notify "$slug-reviewer" "REVIEW PR #$num (head $sha) on $REPO."
       done
     fi
     # The fixer, when idle, also wakes for its own PRs with changes requested, but only when that
